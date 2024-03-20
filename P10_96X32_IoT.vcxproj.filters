@@ -15,11 +15,11 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <None Include="P10_96X32_IoT.ino" />
-  </ItemGroup>
-  <ItemGroup>
     <ClInclude Include="__vm\.P10_96X32_IoT.vsarduino.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="P10_96X32_IoT.ino" />
   </ItemGroup>
 </Project>

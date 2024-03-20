@@ -5,12 +5,24 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <String.h>
-#include <DMD32.h>       
+#include <DMD32_B.h>       
 #include "fonts/SystemFont5x7_greek.h"
 #include "fonts/Verdana_Greek.h"
 #include <WiFiClientSecure.h>
 #include <Arduino_JSON.h>
 #include "time.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DS1302.h>
+
+// DS1302 RTC instance
+Ds1302 rtc(4, 32, 25);
+// GPIO where the DS18B20 is connected to
+const int oneWireBus = 35;
+// Setup a oneWire instance to communicate with any OneWire devices
+OneWire oneWire(oneWireBus);
+// Pass our oneWire reference to Dallas Temperature sensor 
+DallasTemperature sensors(&oneWire);
 
 #define OPEN_HOT_SPOT 36
 #define REG_BRIGHTNESS 20
@@ -33,7 +45,7 @@ int statusCode;
 
 const char Company[] = { "Rousis Systems" };
 const char Device[] = { "IoT LED display" };
-const char Version[] = { "V.1.1" };
+const char Version[] = { "V.2.1" };
 static char page_buf[250];
 uint32_t page_len;
 char timedisplay[8];
@@ -50,7 +62,7 @@ const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 0; // 7200;
 const int   daylightOffset_sec = 0; // 3600;
 
-#define LED_PIN 22
+#define LED_PIN 13
 
 // Code with critica section
 //void IRAM_ATTR onTime() {
@@ -61,24 +73,26 @@ const int   daylightOffset_sec = 0; // 3600;
 //    portEXIT_CRITICAL_ISR(&timerMux);
 //}
 //Fire up the DMD library as dmd
-#define DISPLAYS_ACROSS 3
+//Fire up the DMD library as dmd
+#define DISPLAYS_ACROSS 2 //4
 #define DISPLAYS_DOWN 1
-DMD dmd(DISPLAYS_ACROSS, DISPLAYS_DOWN);
-
-//Timer setup
-//create a hardware timer  of ESP32
-hw_timer_t* timer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+DMD dmd(DISPLAYS_ACROSS, DISPLAYS_DOWN, PROTOCOL_QIANGLI);
+#define PIXELS_X (DISPLAYS_ACROSS * 32)
+#define PIXELS_Y (DISPLAYS_DOWN * 16)
+hw_timer_t* scan_timer = NULL;
 
 /*--------------------------------------------------------------------------------------
   Interrupt handler for Timer1 (TimerOne) driven DMD refresh scanning, this gets
   called at the period set in Timer1.initialize();
 --------------------------------------------------------------------------------------*/
+
+portMUX_TYPE Scan_timerMux = portMUX_INITIALIZER_UNLOCKED;
+
 void IRAM_ATTR triggerScan()
 {
-    portENTER_CRITICAL_ISR(&timerMux);
+    portENTER_CRITICAL_ISR(&Scan_timerMux);
     dmd.scanDisplayBySPI();
-    portEXIT_CRITICAL_ISR(&timerMux);
+    portEXIT_CRITICAL_ISR(&Scan_timerMux);
 }
 
 void test_patern_slash() {
@@ -114,19 +128,19 @@ void setup() {
     Serial.begin(115200);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
+    sensors.begin();
+    sensors.setResolution(12);
+    rtc.init();
+    //Set off the tricle charge of the DS1302
 
-    // return the clock speed of the CPU
+    //-----------------------------------------------------------------------------------------
     uint8_t cpuClock = ESP.getCpuFreqMHz();
-    // Use 1st timer of 4 
-    // devide cpu clock speed on its speed value by MHz to get 1us for each signal  of the timer
-    timer = timerBegin(0, cpuClock, true);
-    // Attach triggerScan function to our timer 
-    timerAttachInterrupt(timer, &triggerScan, true);
-    // Set alarm to call triggerScan function  
-    // Repeat the alarm (third parameter) 
-    timerAlarmWrite(timer, 300, true);
-    // Start an alarm 
-    timerAlarmEnable(timer);
+
+    scan_timer = timerBegin(0, cpuClock, true);
+    timerAttachInterrupt(scan_timer, &triggerScan, true);
+    timerAlarmWrite(scan_timer, 500, true); //timerAlarmWrite(scan_timer, 1000, true);
+    //timerAlarmEnable(scan_timer);    
+    //------------------------------------------------------------------------------------------
 
     //clear/init the DMD pixels held in RAM
     dmd.clearScreen(true);   //true is normal (all pixels off), false is negative (all pixels on)
@@ -135,10 +149,10 @@ void setup() {
     //myLED.selectFont(SystemFont5x7_greek); //font1
     delay(200);
 
-    dmd.drawString(0, 0, "Initialize WiFi", 15, GRAPHICS_NORMAL);
+    dmd.drawString(0, 0, "Initialize WiFi", 15, GRAPHICS_NORMAL, 1);
     delay(3000);
     dmd.clearScreen(true);
-    timerAlarmDisable(timer);
+    timerAlarmDisable(scan_timer);
     //dmd.drawString(0, 0, "Disable Display", 15, GRAPHICS_NORMAL);
 
 
@@ -213,10 +227,10 @@ void setup() {
 
     itoa(WiFi.RSSI(), &rssi[8], 10);
 
-    timerAlarmEnable(timer);
+    timerAlarmEnable(scan_timer);
     dmd.clearScreen(true);;
-    dmd.drawString(0, 0, "WiFi Connected!", 15, GRAPHICS_NORMAL);
-    dmd.drawString(0, 8, rssi, 16, GRAPHICS_NORMAL);
+    dmd.drawString(0, 0, "WiFi Connected!", 15, GRAPHICS_NORMAL,1);
+    dmd.drawString(0, 8, rssi, 16, GRAPHICS_NORMAL,1);
     delay(2000);
     //myLED.selectFont(SystemFont5x7_greek); //font1
     ////myLED.displayBrightness(100);
@@ -253,6 +267,7 @@ void setup() {
     //Europe/Athens	EET-2EEST,M3.5.0/3,M10.5.0/4
     setTimezone("EET-2EEST,M3.5.0/3,M10.5.0/4");
     printLocalTime();
+    SetExtRTC();
 
     //helpmac.toCharArray(mac_address, 16, 0);
     Serial.println("Display the Start up Version:");
@@ -261,18 +276,18 @@ void setup() {
     Serial.println(Version);
 
     dmd.clearScreen(true);;
-    dmd.drawString(0, 0, Company, sizeof(Company) - 1, GRAPHICS_NORMAL);
-    dmd.drawString(0, 8, Device, sizeof(Device) - 1, GRAPHICS_NORMAL);
+    dmd.drawString(0, 0, Company, sizeof(Company) - 1, GRAPHICS_NORMAL, 1);
+    dmd.drawString(0, 8, Device, sizeof(Device) - 1, GRAPHICS_NORMAL, 1);
     delay(2000);
 
     dmd.clearScreen(true);
-    dmd.drawString(0, 0, "Software Version", 16, GRAPHICS_NORMAL);
-    dmd.drawString(0, 8, Version, sizeof(Version) - 1, GRAPHICS_NORMAL);
+    dmd.drawString(0, 0, "Software Version", 16, GRAPHICS_NORMAL,1);
+    dmd.drawString(0, 8, Version, sizeof(Version) - 1, GRAPHICS_NORMAL,1);
     delay(2000);
     
-    dmd.clearScreen(true);;
-    dmd.drawString(0, 0, "Sign ID:", 8, GRAPHICS_NORMAL);
-    dmd.drawString(0, 8, mac_address, sizeof(mac_address), GRAPHICS_NORMAL);
+    dmd.clearScreen(true);
+    dmd.drawString(0, 0, "Sign ID:", 8, GRAPHICS_NORMAL,1);
+    dmd.drawString(0, 8, mac_address, sizeof(mac_address), GRAPHICS_NORMAL,1);
     delay(4000);
      
     dmd.selectFont(Verdana_Greek);
@@ -293,6 +308,7 @@ void setup() {
 }
 
 void loop() {
+    uint16_t center1;
     digitalWrite(LED_PIN, HIGH);
     //test_patern_slash();
 
@@ -350,6 +366,7 @@ void loop() {
     /*Serial.print("enable: ");
     Serial.println(myObject["page1"]["enable"]);*/
     String page; String enable;
+    int speed;
     int i;
     //------------------------------------------------------------------------------------------------------
         //String page1 = JSON.stringify(myObject["page1"]["text"]);    
@@ -362,23 +379,28 @@ void loop() {
     Serial.println(myObject["settings"]["clockcheck"]);
     Serial.print("Date Display: ");
     Serial.println(myObject["settings"]["datecheck"]);
+    Serial.print("Temperature: ");
+    Serial.println(myObject["settings"]["tempcheck"]);
     Serial.print("Brightness: ");
     Serial.println(myObject["settings"]["brightness"]);
     Serial.println("--------------------------------------------");
+    /*String brightness = myObject["settings"]["brightness"];
+    dmd.setBrightness(brightness.toInt());*/
     //------------------------------------------------------------------------------------------------------
     page = myObject["settings"]["active"];
     if (page == "0") {
         Serial.print("Sign is inactive...");
         dmd.clearScreen(true);
-        dmd.drawString(0, 0, "inactive", 8, GRAPHICS_NORMAL);
+        dmd.drawString(0, 0, "inactive", 8, GRAPHICS_NORMAL, 1);
         return;
     }
     //------------------------------------------------------------------------------------------------------
     page = myObject["page1"]["enable"];
+    speed = myObject["page1"]["speed"];
     if (page == "1") {
         page = JSON.stringify(myObject["page1"]["text"]);
         int str_len = page.length() + 1;
-        char char_array[str_len];
+        char* char_array = new char[str_len];
         page.toCharArray(char_array, str_len);
         remove_quotes(char_array);
         decodeUTF8(char_array);
@@ -387,30 +409,25 @@ void loop() {
         Serial.println(page);
         Serial.println("--------------------------------------------");
         dmd.clearScreen(true);
-        if (page_len > 10) {
-            dmd.drawMarquee(page_buf, page_len, 0, 0 );
-            long start = millis();
-            long timer = start;
-            boolean ret = false;
-            while (!ret) {
-                if ((timer + 15) < millis()) {
-                    ret = dmd.stepMarquee(-1, 0);
-                    timer = millis();
-                }
-            }
+        center1 = get_center(page_buf, page_len, 1);
+        if (center1 > PIXELS_X) {
+            dmd.scrollingString(0, 0, page_buf, page_len, 1, speed);
+            
         }
         else {
-            dmd.drawString(0, 0, page_buf, page_len, GRAPHICS_NORMAL);
+            dmd.drawString((PIXELS_X - center1) / 2, 0, page_buf, page_len, GRAPHICS_NORMAL, 1);
+            delay(3000);
         }
         Serial.println();
-        delay(3000);
+        
     }
 
     page = myObject["page2"]["enable"];
+    speed = myObject["page2"]["speed"];
     if (page == "1") {
         page = JSON.stringify(myObject["page2"]["text"]);
         int str_len = page.length() + 1;
-        char char_array[str_len];
+        char* char_array = new char[str_len];
         page.toCharArray(char_array, str_len);
         remove_quotes(char_array);
         decodeUTF8(char_array);
@@ -419,30 +436,25 @@ void loop() {
         Serial.println(page);
         Serial.println("--------------------------------------------");
         dmd.clearScreen(true);
-        if (page_len > 10) {
-            dmd.drawMarquee(page_buf, page_len, 0, 0);
-            long start = millis();
-            long timer = start;
-            boolean ret = false;
-            while (!ret) {
-                if ((timer + 15) < millis()) {
-                    ret = dmd.stepMarquee(-1, 0);
-                    timer = millis();
-                }
-            }
+        center1 = get_center(page_buf, page_len, 1);
+
+        if (center1 > PIXELS_X) {
+            dmd.scrollingString(0, 0, page_buf, page_len, 1, speed);
         }
         else {
-            dmd.drawString(0, 0, page_buf, page_len, GRAPHICS_NORMAL);
+            dmd.drawString((PIXELS_X - center1) / 2, 0, page_buf, page_len, GRAPHICS_NORMAL, 1);
+            delay(3000);
         }
         Serial.println();
-        delay(3000);
+        
     }
 
     page = myObject["page3"]["enable"];
+    speed = myObject["page3"]["speed"];
     if (page == "1") {
         page = JSON.stringify(myObject["page3"]["text"]);
         int str_len = page.length() + 1;
-        char char_array[str_len];
+        char* char_array = new char[str_len];
         page.toCharArray(char_array, str_len);
         remove_quotes(char_array);
         decodeUTF8(char_array);
@@ -451,20 +463,12 @@ void loop() {
         Serial.println(page);
         Serial.println("--------------------------------------------");
         dmd.clearScreen(true);
-        if (page_len > 10) {
-            dmd.drawMarquee(page_buf, page_len, 0, 0);
-            long start = millis();
-            long timer = start;
-            boolean ret = false;
-            while (!ret) {
-                if ((timer + 15) < millis()) {
-                    ret = dmd.stepMarquee(-1, 0);
-                    timer = millis();
-                }
-            }
+        center1 = get_center(page_buf, page_len, 1);
+        if (center1 > PIXELS_X) {
+            dmd.scrollingString(0, 0, page_buf, page_len, 1, speed);
         }
         else {
-            dmd.drawString(0, 0, page_buf, page_len, GRAPHICS_NORMAL);
+            dmd.drawString((PIXELS_X - center1) / 2, 0, page_buf, page_len, GRAPHICS_NORMAL, 1);
         }
         Serial.println();
         delay(3000);
@@ -473,26 +477,63 @@ void loop() {
     //------------------------------------------------------------------------------------------------------
     page = myObject["settings"]["clockcheck"];
     if (page == "1") {
+        center1 = get_center(timedisplay, sizeof(timedisplay), 1);
         dmd.clearScreen(true);
-        dmd.drawString(20, 0, timedisplay, sizeof(timedisplay), GRAPHICS_NORMAL);
+        dmd.drawString((PIXELS_X - center1) / 2, 0, timedisplay, sizeof(timedisplay), GRAPHICS_NORMAL, 1);
         delay(1000);
         printLocalTime();
         dmd.clearScreen(true);
-        dmd.drawString(20, 0, timedisplay, sizeof(timedisplay), GRAPHICS_NORMAL);
+        dmd.drawString((PIXELS_X - center1) / 2, 0, timedisplay, sizeof(timedisplay), GRAPHICS_NORMAL, 1);
         delay(1000);
         printLocalTime();
         dmd.clearScreen(true);
-        dmd.drawString(20, 0, timedisplay, sizeof(timedisplay), GRAPHICS_NORMAL);
+        dmd.drawString((PIXELS_X - center1) / 2, 0, timedisplay, sizeof(timedisplay), GRAPHICS_NORMAL, 1);
         delay(1000);
     }
     //---------------------------------------------------------------------------------------
     page = myObject["settings"]["datecheck"];
     if (page == "1") {
+        center1 = get_center(datedisplay, sizeof(datedisplay), 1);
         dmd.clearScreen(true);
-        dmd.drawString(13, 0, datedisplay, sizeof(datedisplay), GRAPHICS_NORMAL);
+        dmd.drawString((PIXELS_X - center1) / 2, 0, datedisplay, sizeof(datedisplay), GRAPHICS_NORMAL, 1);
+        delay(3000);
+    }
+
+    page = myObject["settings"]["tempcheck"];
+    if (page == "1") {
+        sensors.requestTemperatures();
+        float temperatureC = sensors.getTempCByIndex(0);
+        Serial.print("Temperature: ");
+        Serial.print(temperatureC);
+        Serial.println(" *C");
+        char temp[8];
+        dtostrf(temperatureC, 4, 1, temp);
+        const char degreeStr[3] = { 176,'C',0 };
+        strcat(temp, degreeStr);
+        center1 = get_center(temp, sizeof(temp), 1);
+        dmd.clearScreen(true);
+        dmd.drawString((PIXELS_X - center1) / 2, 0, temp, sizeof(temp), GRAPHICS_NORMAL, 1);
         delay(3000);
     }
 }
+//........................................................................................
+
+uint16_t get_center(String arr, uint8_t len, uint8_t space)
+{
+    uint16_t Legth_page = 0;
+    uint8_t count = 0;
+
+    for (size_t i = 0; i < len; i++)
+    {
+        if (arr[i] == 0)
+            break;
+        count++;
+        Legth_page += dmd.charWidth(arr[i]) + space;
+    }
+    //Serial.print("Characters: "); Serial.println(count);
+    return Legth_page;
+}
+
 
 void printLocalTime() {
     struct tm timeinfo;
@@ -514,9 +555,17 @@ void printLocalTime() {
     strftime(timehelp, 3, "%d", &timeinfo);
     datedisplay[0] = timehelp[0]; datedisplay[1] = timehelp[1]; datedisplay[2] = '/';
     strftime(timehelp, 3, "%m", &timeinfo);
-    datedisplay[3] = timehelp[0]; datedisplay[4] = timehelp[1]; datedisplay[5] = '/';
-    strftime(timehelp, 3, "%y", &timeinfo);
-    datedisplay[6] = timehelp[0]; datedisplay[7] = timehelp[1];
+    datedisplay[3] = timehelp[0]; datedisplay[4] = timehelp[1]; 
+    if (DISPLAYS_ACROSS < 3)
+    {
+        datedisplay[5] = 0;
+    }
+    else
+    {
+        datedisplay[5] = '/';
+        strftime(timehelp, 3, "%y", &timeinfo);
+        datedisplay[6] = timehelp[0]; datedisplay[7] = timehelp[1];
+    }
 }
 
 //----------------------------------------------- Fuctions used for WiFi credentials saving and connecting to it which you do not need to change
@@ -699,4 +748,107 @@ void decodeUTF8(char str[]) {
     page_buf[a++] = 0;
     page_len--;
     Serial.println("/");
+}
+
+void SetExtRTC() {
+
+    Serial.println("Setting the external RTC");
+    setTimezone("GMT0");
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        Serial.println("Failed to obtain time");
+        get_time_externalRTC();
+        return;
+    }
+    setTimezone("EET-2EEST,M3.5.0/3,M10.5.0/4");
+    /*
+        Serial.print("Time to set DS1302: ");
+        Serial.print(timeinfo.tm_year); Serial.print(" ");
+        Serial.print(timeinfo.tm_mon); Serial.print(" ");
+        Serial.print(timeinfo.tm_mday); Serial.print(" ");
+        Serial.print(timeinfo.tm_hour); Serial.print(" ");
+        Serial.print(timeinfo.tm_min); Serial.print(" ");
+        Serial.println(timeinfo.tm_sec);
+        Serial.println("--------------------------------------");*/
+
+    Ds1302::DateTime dt = {
+           .year = timeinfo.tm_year,
+           .month = timeinfo.tm_mon + 1,
+           .day = timeinfo.tm_mday,
+           .hour = timeinfo.tm_hour,
+           .minute = timeinfo.tm_min,
+           .second = timeinfo.tm_sec,
+           .dow = timeinfo.tm_wday
+    };
+    rtc.setDateTime(&dt);
+
+    Serial.println(&timeinfo, "%A, %d %B %Y %H:%M:%S");
+    Serial.println("----------------------------------------");
+}
+
+void get_time_externalRTC() {
+    // get the current time
+    Ds1302::DateTime now;
+    rtc.getDateTime(&now);
+
+    Serial.println();
+    Serial.println("Read and set the external Time from DS1302:");
+
+    Serial.print("20");
+    Serial.print(now.year);    // 00-99
+    Serial.print('-');
+    if (now.month < 10) Serial.print('0');
+    Serial.print(now.month);   // 01-12
+    Serial.print('-');
+    if (now.day < 10) Serial.print('0');
+    Serial.print(now.day);     // 01-31
+    Serial.print(' ');
+    Serial.print(now.dow); // 1-7
+    Serial.print(' ');
+    if (now.hour < 10) Serial.print('0');
+    Serial.print(now.hour);    // 00-23
+    Serial.print(':');
+    if (now.minute < 10) Serial.print('0');
+    Serial.print(now.minute);  // 00-59
+    Serial.print(':');
+    if (now.second < 10) Serial.print('0');
+    Serial.print(now.second);  // 00-59
+    Serial.println();
+    Serial.println("---------------------------------------------");
+
+    setTimezone("GMT0");
+    setTime(now.year + 2000, now.month, now.day, now.hour, now.minute, now.second, 1);
+    setTimezone("EET-2EEST,M3.5.0/3,M10.5.0/4");
+}
+
+void setTime(int yr, int month, int mday, int hr, int minute, int sec, int isDst) {
+    struct tm tm;
+
+    tm.tm_year = yr - 1900;   // Set date
+    tm.tm_mon = month - 1;
+    tm.tm_mday = mday;
+    tm.tm_hour = hr;      // Set time
+    tm.tm_min = minute;
+    tm.tm_sec = sec;
+    tm.tm_isdst = isDaylightSavingTime(&tm);  // 1 or 0
+    time_t t = mktime(&tm);
+    Serial.printf("Setting time: %s", asctime(&tm));
+    struct timeval now = { .tv_sec = t };
+    settimeofday(&now, NULL);
+}
+
+bool isDaylightSavingTime(struct tm* timeinfo) {
+    // Implement your logic to check if DST is in effect based on your timezone's rules
+    // For example, you might check if the current month and day fall within the DST period.
+
+    int month = timeinfo->tm_mon + 1; // Month is 0-11, so add 1
+    int day = timeinfo->tm_mday;
+
+    // Add your DST logic here
+    // For example, assuming DST is from April to October
+    if ((month > 3) && (month < 11)) {
+        return true;
+    }
+
+    return false;
 }
